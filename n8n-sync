@@ -1,0 +1,515 @@
+#!/usr/bin/env bash
+# n8n-sync — portable, dependency-light CI/CD sync for n8n workflows.
+#
+# One self-contained script. Drop it into any project (e.g. ./bin/n8n-sync),
+# `chmod +x`, and run it from the project root. It syncs workflows between a git
+# repo and a running n8n instance over `docker exec` — the SAME command works
+# against a local or a remote Docker daemon; only DOCKER_HOST differs (--remote).
+#
+# Commands:
+#   n8n-sync init        scaffold this project (config file, dirs, .gitignore)
+#   n8n-sync export      n8n  -> repo   (pull; normalized; mirrors the folder tree)
+#   n8n-sync import      repo -> n8n    (push; id-preserving; folders; cred stubs; activation)
+#   n8n-sync normalize   canonicalize workflow JSON files in place
+#   n8n-sync pull        safe `git pull` (export -> stash -> pull -> merge -> import)
+#   n8n-sync help        full usage + the activation model
+#
+# Add --remote to any command to target N8N_REMOTE_DOCKER_HOST instead of the
+# local daemon (e.g. `n8n-sync import --remote`). Run `n8n-sync help` for details.
+#
+# Requires (host-side): bash 4+, jq, docker. NOTE: jq is NOT needed inside the
+# n8n container — that image is minimal and has no jq; all JSON work is host-side.
+set -euo pipefail
+
+VERSION="1.0.0"
+SELF="$(basename "$0")"
+REMOTE=0
+
+die()    { echo "$SELF: $*" >&2; exit 1; }
+need_jq(){ command -v jq >/dev/null || die "jq is required (host-side)"; }
+need_docker(){ command -v docker >/dev/null || die "docker is required"; }
+
+# --- config: env wins; else sourced from $N8N_SYNC_CONFIG | ./.n8n-sync.env | ./.env
+load_config() {
+  local cfg="${N8N_SYNC_CONFIG:-}" c
+  if [ -z "$cfg" ]; then for c in ./.n8n-sync.env ./.env; do [ -f "$c" ] && { cfg="$c"; break; }; done; fi
+  [ -n "$cfg" ] && [ -f "$cfg" ] && { set -a; . "$cfg"; set +a; }
+  N8N_CONTAINER="${N8N_CONTAINER:-n8n}"
+  N8N_PG_CONTAINER="${N8N_PG_CONTAINER:-n8n-postgres}"
+  ACT_KEY="${N8N_API_KEY:-}"
+  WORKFLOWS_DIR="${WORKFLOWS_DIR:-workflows}"
+  SCOPE_FILE="${SCOPE_FILE:-workflow-ids.json}"
+  if [ "$REMOTE" = 1 ]; then
+    [ -n "${N8N_REMOTE_DOCKER_HOST:-}" ] || die "--remote needs N8N_REMOTE_DOCKER_HOST in your config"
+    export DOCKER_HOST="$N8N_REMOTE_DOCKER_HOST"
+  fi
+}
+
+nexec() { docker exec "$N8N_CONTAINER" "$@"; }
+nsh()   { docker exec "$N8N_CONTAINER" sh -c "$1"; }
+pg()    { docker exec -i "$N8N_PG_CONTAINER" sh -c 'exec psql -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" -tAF"|"'; }
+
+scope_ids() { [ -f "$SCOPE_FILE" ] && jq -r '(.workflows // [])[].id' "$SCOPE_FILE" || true; }
+
+# --- canonical form for a workflow JSON (deterministic; strips volatile fields)
+read -r -d '' NORMALIZE_JQ <<'JQ' || true
+del(
+  .updatedAt, .createdAt, .versionId, .triggerCount, .shared, .homeProject,
+  .scopes, .meta, .versionCounter, .activeVersionId, .versionMetadata,
+  .activeVersion, .isArchived, .sourceWorkflowId, .owner
+)
+| .parentFolderId = (.parentFolderId // null)
+| .staticData = null
+| .pinData = (.pinData // {})
+| .tags = ((.tags // []) | map(.name) | unique)
+| .settings = (.settings // {})
+JQ
+
+# --- node helper: (de)activate THROUGH the running n8n REST API so triggers
+#     register LIVE (no restart). Runs inside the container; key from N8N_API_KEY.
+read -r -d '' NODE_ACTIVATE <<'NODE' || true
+const id = process.argv[1], want = process.argv[2] === 'true';
+const base = 'http://localhost:5678/api/v1';
+const h = { 'X-N8N-API-KEY': process.env.N8N_API_KEY, 'Content-Type': 'application/json' };
+const get = () => fetch(`${base}/workflows/${id}`, { headers: h }).then((r) => r.json());
+const post = (a, body) => fetch(`${base}/workflows/${id}/${a}`, { method: 'POST', headers: h, body: JSON.stringify(body || {}) });
+(async () => {
+  if (want) {
+    const wf = await get();
+    const versionId = (wf.activeVersion && wf.activeVersion.versionId) || wf.activeVersionId || wf.versionId || null;
+    const name = `n8n-sync-${id}`;
+    let r = await post('activate', versionId ? { name, versionId } : { name });
+    if (!r.ok && r.status === 400 && versionId) r = await post('activate', { name });
+    if (!r.ok) {
+      const t = await r.text();
+      if (/trigger|webhook|polling|no node to start/i.test(t)) { console.error('  (no production trigger — left inactive)'); process.exit(0); }
+      console.error('activate ' + r.status + ' ' + t.slice(0, 200)); process.exit(1);
+    }
+  } else {
+    await post('deactivate', {});
+  }
+  const w = await get();
+  if ((w.active === true) !== want) { console.error('active=' + w.active + ' want=' + want); process.exit(2); }
+})().catch((e) => { console.error(e && e.message); process.exit(3); });
+NODE
+
+# ============================================================ normalize ====
+normalize_file() {
+  local f="$1" tmp
+  [ -f "$f" ] || { echo "$SELF: skip missing $f" >&2; return 0; }
+  [ "$(basename "$f")" = "folders.json" ] && return 0   # folder manifest, not a workflow
+  tmp="$(mktemp)"
+  jq -S "$NORMALIZE_JQ" "$f" > "$tmp" && mv "$tmp" "$f"   # -S: stable key order
+}
+
+cmd_normalize() {
+  need_jq
+  if [ "$#" -gt 0 ]; then
+    for f in "$@"; do normalize_file "$f"; done
+  else
+    while IFS= read -r f; do normalize_file "$f"; done \
+      < <(find "$WORKFLOWS_DIR" -type f -name '*.json' ! -name 'folders.json' 2>/dev/null)
+  fi
+}
+
+# =============================================================== export ====
+cmd_export() {
+  need_jq; need_docker
+  local scope; scope="$(scope_ids)"
+  in_scope() { [ -z "$scope" ] || grep -qxF -- "$1" <<<"$scope"; }
+
+  echo "==> Exporting workflows from '$N8N_CONTAINER' (${DOCKER_HOST:-local docker}) ..."
+  docker exec "$N8N_CONTAINER" sh -c \
+    'rm -rf /tmp/export && mkdir -p /tmp/export; n8n export:workflow --all --separate --pretty --output=/tmp/export >/dev/null 2>&1 || true'
+  local stage; stage="$(mktemp -d)"
+  docker cp "$N8N_CONTAINER:/tmp/export/." "$stage/" >/dev/null
+  docker exec "$N8N_CONTAINER" rm -rf /tmp/export
+
+  # Safety: against a REMOTE (shared) instance, refuse to mirror everything.
+  if [ -z "$scope" ] && [ -n "${DOCKER_HOST:-}" ]; then
+    echo "$SELF: $SCOPE_FILE is empty — refusing to mirror the whole REMOTE instance." >&2
+    for f in "$stage"/*.json; do [ -e "$f" ] && jq -r '"  { \"id\": \"\(.id)\", \"name\": \"\(.name)\" }"' "$f" >&2; done
+    rm -rf "$stage"; exit 1
+  fi
+
+  # Folder tree + workflow membership from the DB (n8n export omits both).
+  declare -A FNAME FPARENT WF_PARENT
+  while IFS='|' read -r fid fname fparent _; do
+    [ -n "$fid" ] && { FNAME["$fid"]="$fname"; FPARENT["$fid"]="$fparent"; }
+  done < <(printf 'SELECT id,name,"parentFolderId","projectId" FROM folder;\n' | pg)
+  while IFS='|' read -r wid wpar; do
+    [ -n "$wid" ] && WF_PARENT["$wid"]="$wpar"
+  done < <(printf 'SELECT id,"parentFolderId" FROM workflow_entity;\n' | pg)
+
+  folder_path() {            # folder id -> "A/B/Leaf" (names; '/' in a name -> '-')
+    local id="$1" parts="" name
+    while [ -n "${id:-}" ]; do
+      name="${FNAME[$id]:-}"; [ -n "$name" ] || break
+      name="${name//\//-}"; parts="$name${parts:+/}$parts"; id="${FPARENT[$id]:-}"
+    done
+    printf '%s' "$parts"
+  }
+
+  # Rebuild from scratch so folder MOVES are reflected; out-of-scope files pruned.
+  mkdir -p "$WORKFLOWS_DIR"
+  find "$WORKFLOWS_DIR" -type f -name '*.json' ! -name 'folders.json' -delete
+
+  declare -A keep=() USED_FOLDER=()
+  for f in "$stage"/*.json; do
+    [ -e "$f" ] || continue
+    local base id pfid rel cur dest
+    base="$(basename "$f")"; id="${base%.json}"
+    in_scope "$id" || continue
+    pfid="${WF_PARENT[$id]:-}"; rel=""
+    if [ -n "$pfid" ]; then
+      rel="$(folder_path "$pfid")"
+      cur="$pfid"; while [ -n "${cur:-}" ]; do USED_FOLDER["$cur"]=1; cur="${FPARENT[$cur]:-}"; done
+    fi
+    dest="$WORKFLOWS_DIR${rel:+/$rel}/$base"
+    mkdir -p "$(dirname "$dest")"
+    # export omits parentFolderId -> inject it from the DB, then normalize.
+    jq --arg p "$pfid" '.parentFolderId = (if $p == "" then null else $p end)' "$f" > "$dest"
+    normalize_file "$dest"
+    keep["$id"]=1
+  done
+  rm -rf "$stage"
+
+  # folders.json = folders actually used by in-scope workflows (+ ancestors).
+  local all_folders used_json
+  all_folders="$(printf "SELECT coalesce(json_agg(json_build_object('id',id,'name',name,'parentFolderId',\"parentFolderId\") ORDER BY id),'[]') FROM folder;\n" | pg)"
+  if [ "${#USED_FOLDER[@]}" -gt 0 ]; then
+    used_json="$(printf '%s\n' "${!USED_FOLDER[@]}" | jq -R . | jq -s .)"
+  else
+    used_json="[]"
+  fi
+  jq -n --argjson all "$all_folders" --argjson used "$used_json" \
+    '$all | map(select(.id as $i | $used | index($i)))' > "$WORKFLOWS_DIR/folders.json"
+
+  find "$WORKFLOWS_DIR" -mindepth 1 -type d -empty -delete
+  echo "==> ${#keep[@]} workflow(s) + $(jq length "$WORKFLOWS_DIR/folders.json") folder(s) in ./$WORKFLOWS_DIR/ — review 'git diff', then commit."
+}
+
+# =============================================================== import ====
+cmd_import() {
+  need_jq; need_docker
+  shopt -s nullglob globstar
+  local files=() scope
+  mapfile -t files < <(find "$WORKFLOWS_DIR" -type f -name '*.json' ! -name 'folders.json' 2>/dev/null | sort)
+  scope="$(scope_ids)"
+  in_scope() { [ -z "$scope" ] || grep -qxF -- "$1" <<<"$scope"; }
+  if [ -n "$scope" ]; then
+    local in_files=() f
+    for f in "${files[@]}"; do
+      in_scope "$(basename "$f" .json)" && in_files+=("$f") || echo "  • skipped $f (not in $SCOPE_FILE)"
+    done
+    files=("${in_files[@]+"${in_files[@]}"}")
+  fi
+  [ "${#files[@]}" -gt 0 ] || { echo "==> No workflows in scope — nothing to import."; exit 0; }
+  echo "==> Importing ${#files[@]} workflow(s) into '$N8N_CONTAINER' (${DOCKER_HOST:-local docker}) ..."
+
+  # 1. credential stubs: seed referenced-but-missing creds empty (diff vs the
+  #    target's own export so filled-in secrets are never overwritten).
+  local needed have stubs
+  needed="$(jq -s '[ .[].nodes[]? | (.credentials // {}) | to_entries[]
+    | {id: .value.id, name: .value.name, type: .key} | select(.id != null) ] | unique_by(.id)' "${files[@]}")"
+  have="$(nsh 'rm -f /tmp/creds.json; n8n export:credentials --all --output=/tmp/creds.json >/dev/null 2>&1 || true; cat /tmp/creds.json 2>/dev/null || echo "[]"; rm -f /tmp/creds.json' | jq -c '[ .[].id ]')"
+  stubs="$(jq -n --argjson n "$needed" --argjson h "$have" \
+    '[ $n[] | select((.id as $i | $h | index($i)) | not) | {id, name, type, data: {}} ]')"
+  if [ "$(jq length <<<"$stubs")" -gt 0 ]; then
+    echo "==> Seeding credential stubs (fill secrets in the UI — EDIT the stub):"
+    jq -r '.[] | "  + \(.name)  [\(.type)]  id=\(.id)"' <<<"$stubs"
+    local tmp; tmp="$(mktemp)"; printf '%s' "$stubs" > "$tmp"
+    nsh 'rm -rf /tmp/stubs && mkdir -p /tmp/stubs'
+    docker cp "$tmp" "$N8N_CONTAINER:/tmp/stubs/stubs.json" >/dev/null && rm -f "$tmp"
+    nsh 'n8n import:credentials --input=/tmp/stubs/stubs.json; rm -rf /tmp/stubs'
+  fi
+
+  # 2. folders: upsert the tree into the target's personal project (ids preserved,
+  #    projectId remapped). Two passes so the self-referential FK is satisfied.
+  local nfolders proj jqprog
+  nfolders="$([ -f "$WORKFLOWS_DIR/folders.json" ] && jq 'length' "$WORKFLOWS_DIR/folders.json" || echo 0)"
+  if [ "$nfolders" -gt 0 ]; then
+    proj="$(printf 'SELECT id FROM project WHERE type=%s ORDER BY "createdAt" LIMIT 1;\n' "'personal'" | pg)"
+    [ -n "$proj" ] || die "no personal project on target — cannot place folders"
+    echo "==> Upserting $nfolders folder(s) into project $proj ..."
+    jqprog="$(cat <<'JQ'
+def sq: tostring | gsub("'"; "''");
+def val: if . == null then "NULL" else "'\(sq)'" end;
+( .[] | "INSERT INTO folder (id,name,\"projectId\",\"createdAt\",\"updatedAt\") VALUES (\(.id|val),\(.name|val),\($proj|val),now(),now()) ON CONFLICT (id) DO UPDATE SET name=EXCLUDED.name,\"projectId\"=EXCLUDED.\"projectId\",\"updatedAt\"=now();" ),
+( .[] | "UPDATE folder SET \"parentFolderId\"=\(.parentFolderId|val),\"updatedAt\"=now() WHERE id=\(.id|val);" )
+JQ
+)"
+    jq -r --arg proj "$proj" "$jqprog" "$WORKFLOWS_DIR/folders.json" | pg >/dev/null
+  fi
+
+  # 3. workflows: import (create + update, id-preserving). Note: import deactivates.
+  echo "==> Importing ${#files[@]} workflow(s) via the container CLI ..."
+  local stage; stage="$(mktemp -d)"; cp "${files[@]}" "$stage/"
+  nsh 'rm -rf /tmp/import && mkdir -p /tmp/import'
+  docker cp "$stage/." "$N8N_CONTAINER:/tmp/import/" >/dev/null && rm -rf "$stage"
+  nsh 'n8n import:workflow --separate --input=/tmp/import; rm -rf /tmp/import'
+
+  # 4. folder membership (the CLI import doesn't set parentFolderId).
+  local f id pfid
+  for f in "${files[@]}"; do
+    id="$(basename "$f" .json)"; pfid="$(jq -r '.parentFolderId // empty' "$f")"
+    if [ -n "$pfid" ]; then
+      printf 'UPDATE workflow_entity SET "parentFolderId"=%s WHERE id=%s;\n' "'$pfid'" "'$id'" | pg >/dev/null
+    else
+      printf 'UPDATE workflow_entity SET "parentFolderId"=NULL WHERE id=%s;\n' "'$id'" | pg >/dev/null
+    fi
+  done
+
+  # 5. activation — CREDENTIAL-AWARE + cycle-safe.
+  #    Readiness: a workflow is READY when every credential its ENABLED nodes
+  #    reference already EXISTED on the target before this run (i.e. is in `have`).
+  #    Freshly-seeded stubs are not in `have`, so those workflows are reported as
+  #    "pending" (fill the secret in the UI, then re-run) instead of failing.
+  local filled_json="${have:-[]}" want name missing
+  local ready_ids=() pending=""
+  echo "==> Resolving credential-readiness ..."
+  for f in "${files[@]}"; do
+    id="$(basename "$f" .json)"; want="$(jq -r '.active' "$f")"; name="$(jq -r '.name' "$f")"
+    if [ "$want" != "true" ]; then
+      if [ -n "$ACT_KEY" ]; then docker exec -e N8N_API_KEY="$ACT_KEY" "$N8N_CONTAINER" node -e "$NODE_ACTIVATE" "$id" false >/dev/null 2>&1 || true
+      else nexec n8n unpublish:workflow --id="$id" >/dev/null 2>&1 || true; fi
+      echo "  ○ inactive   '$name' (id=$id)"; continue
+    fi
+    missing="$(jq -r --argjson filled "$filled_json" '
+      [ .nodes[]? | select(.disabled != true) | (.credentials // {}) | to_entries[]
+        | {id: .value.id, name: .value.name, type: .key} | select(.id != null) ]
+      | unique_by(.id) | map(select(.id as $i | ($filled | index($i)) | not))
+      | .[] | "\(.name) [\(.type)] id=\(.id)"' "$f")"
+    if [ -n "$missing" ]; then
+      echo "  ⏳ '$name' (id=$id) — pending credentials:"
+      sed 's/^/        · /' <<<"$missing"
+      pending+="  • $name (id=$id):"$'\n'"$(sed 's/^/        · /' <<<"$missing")"$'\n'
+      continue
+    fi
+    echo "  ✓ ready      '$name' (id=$id)"; ready_ids+=("$id")
+  done
+
+  if [ "${#ready_ids[@]}" -gt 0 ]; then
+    # PRE-PUBLISH in the DB, exactly like n8n Source Control's resolvePublishedStatus:
+    # set activeVersionId directly via a raw UPDATE. In n8n 2.x a parent workflow may
+    # only reference a PUBLISHED sub-workflow (activeVersionId != null); the publish-
+    # time check runs in BOTH the API activate and `publish:workflow`, so a MUTUAL
+    # Execute-Sub-workflow cycle deadlocks (neither can publish first). A raw UPDATE
+    # bypasses that check; the check reads activeVersionId fresh from the DB, so once
+    # all ready workflows have it set, every reference resolves. NOTE: this does NOT
+    # register triggers — the API activate below does that.
+    local ids_sql; ids_sql="$(printf "'%s'," "${ready_ids[@]}")"; ids_sql="${ids_sql%,}"
+    echo "==> Pre-publishing ${#ready_ids[@]} workflow(s) in the DB (activeVersionId := versionId) ..."
+    printf 'UPDATE workflow_entity SET active=true, "activeVersionId"="versionId" WHERE id IN (%s);\n' "$ids_sql" | pg >/dev/null
+
+    if [ -n "$ACT_KEY" ]; then
+      # Register triggers LIVE via the API (no restart). References already resolve,
+      # so no deadlock; the passes only absorb transient errors (e.g. Telegram
+      # setWebhook rate-limits). A trigger that genuinely can't register on this env
+      # (e.g. a webhook with no public HTTPS URL) warns — non-fatal.
+      echo "==> Activating ${#ready_ids[@]} workflow(s) via the API (live — no restart) ..."
+      declare -A last_err=()
+      local remaining=("${ready_ids[@]}") pass failed err
+      for pass in 1 2 3; do
+        [ "${#remaining[@]}" -gt 0 ] || break
+        failed=()
+        for id in "${remaining[@]}"; do
+          if err="$(docker exec -e N8N_API_KEY="$ACT_KEY" "$N8N_CONTAINER" node -e "$NODE_ACTIVATE" "$id" true 2>&1)"; then
+            echo "  ▶ activated   (id=$id)"
+          else
+            failed+=("$id"); last_err["$id"]="$err"
+          fi
+        done
+        remaining=("${failed[@]+"${failed[@]}"}")
+        [ "${#remaining[@]}" -gt 0 ] || break
+        [ "$pass" -lt 3 ] && { echo "  ↻ ${#remaining[@]} not active yet (transient) — retry pass $((pass+1)) after backoff ..."; sleep 5; }
+      done
+      if [ "${#remaining[@]}" -gt 0 ]; then
+        for id in "${remaining[@]}"; do
+          echo "  ⚠ could not activate id=$id after 3 passes (non-fatal): $(printf '%s' "${last_err[$id]:-}" | tr '\n' ' ' | cut -c1-180)" >&2
+        done
+      fi
+    else
+      echo "  ⚠ no N8N_API_KEY — workflow(s) pre-published in the DB; restart n8n to register triggers."
+    fi
+  fi
+
+  # 6. orphans: in n8n (within scope) but not in git -> deactivate + report.
+  local git_ids oid oname
+  git_ids="$(for f in "${files[@]}"; do basename "$f" .json; done)"
+  while IFS='|' read -r oid oname; do
+    [ -n "$oid" ] && in_scope "$oid" && ! grep -qxF -- "$oid" <<<"$git_ids" || continue
+    echo "  ⊟ '${oname}' (id=${oid}) not in git — deactivating; archive/delete it in the UI"
+    if [ -n "$ACT_KEY" ]; then docker exec -e N8N_API_KEY="$ACT_KEY" "$N8N_CONTAINER" node -e "$NODE_ACTIVATE" "$oid" false >/dev/null 2>&1 || true
+    else nexec n8n unpublish:workflow --id="$oid" >/dev/null 2>&1 || true; fi
+  done < <(nexec n8n list:workflow 2>/dev/null | tr -d '\r' | grep -E '^[A-Za-z0-9_-]+\|' || true)
+
+  # 7. verify presence.
+  local present rc=0
+  present="$(nexec n8n list:workflow 2>/dev/null | tr -d '\r' | cut -d'|' -f1)"
+  for f in "${files[@]}"; do
+    id="$(basename "$f" .json)"
+    grep -qxF -- "$id" <<<"$present" || { echo "$SELF: id=$id not found after import" >&2; rc=1; }
+  done
+  if [ "$rc" -eq 0 ]; then
+    if [ -n "$ACT_KEY" ]; then echo "==> Done. Activation applied live via the API — no restart needed."
+    else echo "==> Done. (no API key: restart n8n to register triggers; folders/metadata are already live)"; fi
+    if [ -n "$pending" ]; then
+      echo ""
+      echo "==> Some workflows are INACTIVE pending credentials. Fill the secrets in the"
+      echo "    n8n UI (Settings → Credentials → open the stub → Save), then re-run import:"
+      printf '%s' "$pending"
+    fi
+  fi
+  return "$rc"
+}
+
+# ================================================================= pull ====
+cmd_pull() {
+  need_jq; need_docker
+  command -v git >/dev/null || die "git is required for pull"
+  echo "==> Exporting local n8n state ..."; cmd_export
+  local stashed=0
+  if ! git diff --quiet -- "$WORKFLOWS_DIR/" || ! git diff --cached --quiet -- "$WORKFLOWS_DIR/"; then
+    git stash push -q -u -m "n8n-sync-local-edits" -- "$WORKFLOWS_DIR/"; stashed=1
+    echo "==> Stashed your local workflow edits."
+  fi
+  echo "==> Pulling ..."; git pull --no-edit
+  if [ "$stashed" -eq 1 ]; then
+    if git stash pop; then echo "==> Your local edits merged with incoming changes."
+    else echo "" >&2; echo "✗ Merge conflict — resolve in ./$WORKFLOWS_DIR/, then run: $SELF import" >&2; exit 1; fi
+  fi
+  echo "==> Importing merged result into local n8n ..."; cmd_import
+  echo "==> Done. Local n8n reflects the merged state. Review 'git status' and commit."
+}
+
+# ================================================================= init ====
+cmd_init() {
+  local cfg=".n8n-sync.env"
+  mkdir -p "${WORKFLOWS_DIR}"
+  echo "✓ ${WORKFLOWS_DIR}/ ready"
+
+  if [ ! -f "$SCOPE_FILE" ]; then
+    printf '{\n  "workflows": []\n}\n' > "$SCOPE_FILE"
+    echo "✓ created $SCOPE_FILE (list the {id,name} you sync; empty = everything)"
+  else
+    echo "• $SCOPE_FILE exists — left untouched"
+  fi
+
+  if [ ! -f "$cfg" ]; then
+    cat > "$cfg" <<'CFG'
+# n8n-sync config — committed? NO. Holds the target API key. Keep it out of git.
+# Values here are sourced by n8n-sync; env vars set before the call also work.
+
+# n8n (main) container name on the TARGET, and its Postgres container.
+# Local and remote should use the SAME names — only the daemon differs.
+N8N_CONTAINER=n8n
+N8N_PG_CONTAINER=n8n-postgres
+
+# Target's public API key (UI → Settings → n8n API). Enables LIVE activation
+# (triggers register without an n8n restart). Empty -> CLI publish (needs restart).
+N8N_API_KEY=
+
+# Remote daemon over SSH for `n8n-sync <cmd> --remote` (docker exec tunnels over
+# SSH, so the remote run is identical to the local one). Empty = local only.
+N8N_REMOTE_DOCKER_HOST=
+
+# Optional overrides:
+# WORKFLOWS_DIR=workflows
+# SCOPE_FILE=workflow-ids.json
+CFG
+    echo "✓ created $cfg — fill N8N_API_KEY (and N8N_REMOTE_DOCKER_HOST for --remote)"
+  else
+    echo "• $cfg exists — left untouched"
+  fi
+
+  # Keep the secret-bearing config out of git.
+  if [ -f .gitignore ]; then
+    grep -qxF "$cfg" .gitignore || { printf '%s\n' "$cfg" >> .gitignore; echo "✓ added $cfg to .gitignore"; }
+  else
+    printf '%s\n' "$cfg" > .gitignore; echo "✓ created .gitignore ($cfg)"
+  fi
+
+  cat <<EOF
+
+Setup complete. Next:
+  1. Edit $cfg — set N8N_API_KEY (and container names if they differ).
+  2. $SELF export                # pull current n8n workflows into ./$WORKFLOWS_DIR/
+  3. commit ./$WORKFLOWS_DIR/ and $SCOPE_FILE
+  4. $SELF import                # push ./$WORKFLOWS_DIR/ back into n8n
+     $SELF import --remote       # ...or into the remote (N8N_REMOTE_DOCKER_HOST)
+EOF
+}
+
+# ================================================================= help ====
+cmd_help() {
+  cat <<EOF
+$SELF $VERSION — portable CI/CD sync for n8n workflows (over docker exec).
+
+USAGE
+  $SELF <command> [--remote] [args]
+
+COMMANDS
+  init               Scaffold this project: $WORKFLOWS_DIR/, $SCOPE_FILE, .n8n-sync.env, .gitignore.
+  export             n8n  -> repo. Exports all workflows, normalizes them, mirrors the
+                     n8n folder tree as directories, writes $WORKFLOWS_DIR/folders.json.
+  import             repo -> n8n. Id-preserving CLI import; upserts folders (psql);
+                     seeds missing credential stubs; activates (see ACTIVATION).
+  normalize [file…]  Canonicalize workflow JSON in place (all under $WORKFLOWS_DIR if none given).
+  pull               Safe git pull: export → stash → git pull (3-way merge) → import.
+  help               This text.
+
+  --remote           Target N8N_REMOTE_DOCKER_HOST instead of the local daemon.
+
+CONFIG  (env wins; else \$N8N_SYNC_CONFIG | ./.n8n-sync.env | ./.env)
+  N8N_CONTAINER          n8n container on the target            [n8n]
+  N8N_PG_CONTAINER       its Postgres container                 [n8n-postgres]
+  N8N_API_KEY            target public API key -> live activate  []
+  N8N_REMOTE_DOCKER_HOST ssh://user@host for --remote            []
+  WORKFLOWS_DIR          repo dir for workflow JSON + folders.json [workflows]
+  SCOPE_FILE             {"workflows":[{id,name}]} limiting sync  [workflow-ids.json]
+
+WHY docker exec + psql
+  The n8n CLI preserves entity ids (the public REST API cannot create-with-id), and
+  n8n folders have no CLI/API — only the DB. The SAME command works local or remote;
+  only DOCKER_HOST differs. jq runs HOST-side only (the n8n image has no jq).
+
+ACTIVATION (import)
+  Credential-aware: a workflow activates only when every credential its enabled nodes
+  reference already exists on the target; others are left inactive and listed as
+  "pending credentials" (fill the secret in the UI, then re-run — idempotent).
+  Cycle-safe: in n8n 2.x a parent may reference only a PUBLISHED sub-workflow, so a
+  mutual Execute-Sub-workflow pair would deadlock the publish-time check. import first
+  sets activeVersionId directly in the DB (raw UPDATE, like Source Control's pull),
+  which the check reads fresh — so references resolve — then calls the REST API to
+  register triggers LIVE (no restart). With no API key it pre-publishes in the DB and
+  you restart n8n once to register triggers.
+EOF
+}
+
+# ================================================================= main ====
+main() {
+  local cmd="" args=()
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --remote)        REMOTE=1 ;;
+      -h|--help)       cmd="help" ;;
+      --version)       echo "$SELF $VERSION"; exit 0 ;;
+      init|import|export|normalize|pull|help)
+                       [ -z "$cmd" ] && cmd="$1" || args+=("$1") ;;
+      *)               args+=("$1") ;;
+    esac
+    shift
+  done
+  [ -n "$cmd" ] || { cmd_help; exit 1; }
+  load_config
+  case "$cmd" in
+    help)      cmd_help ;;
+    init)      cmd_init ;;
+    export)    cmd_export ;;
+    import)    cmd_import ;;
+    normalize) cmd_normalize "${args[@]+"${args[@]}"}" ;;
+    pull)      cmd_pull ;;
+  esac
+}
+main "$@"

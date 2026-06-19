@@ -21,7 +21,7 @@
 # n8n container — that image is minimal and has no jq; all JSON work is host-side.
 set -euo pipefail
 
-VERSION="1.3.0"
+VERSION="1.4.0"
 SELF="$(basename "$0")"
 REMOTE=0
 
@@ -282,27 +282,36 @@ cmd_import() {
   fi
   echo "==> Target project: $proj"
 
-  # 1. credential stubs: seed referenced-but-missing creds empty (diff vs the
-  #    target's own export so filled-in secrets are never overwritten).
-  local needed have stubs
-  needed="$(jq -s '[ .[].nodes[]? | (.credentials // {}) | to_entries[]
-    | {id: .value.id, name: .value.name, type: .key} | select(.id != null) ] | unique_by(.id)' "${files[@]}")"
-  have="$(nsh 'rm -f /tmp/creds.json; n8n export:credentials --all --output=/tmp/creds.json >/dev/null 2>&1 || true; cat /tmp/creds.json 2>/dev/null || echo "[]"; rm -f /tmp/creds.json' | jq -c '[ .[].id ]')"
-  stubs="$(jq -n --argjson n "$needed" --argjson h "$have" \
-    '[ $n[] | select((.id as $i | $h | index($i)) | not) | {id, name, type, data: {}} ]')"
-  if [ "$(jq length <<<"$stubs")" -gt 0 ]; then
-    echo "==> Seeding credential stubs (fill secrets in the UI — EDIT the stub):"
-    jq -r '.[] | "  + \(.name)  [\(.type)]  id=\(.id)"' <<<"$stubs"
-    local tmp; tmp="$(mktemp)"; printf '%s' "$stubs" > "$tmp"
-    nsh 'rm -rf /tmp/stubs && mkdir -p /tmp/stubs'
-    docker cp "$tmp" "$N8N_CONTAINER:/tmp/stubs/stubs.json" >/dev/null && rm -f "$tmp"
-    nsh 'n8n import:credentials --input=/tmp/stubs/stubs.json; rm -rf /tmp/stubs'
-  fi
+  # Change detection: only import/activate workflows whose normalized definition (or
+  # active flag) differs from what's already on the instance — skipping the rest
+  # avoids needless re-import + the deactivate/reactivate downtime. The
+  # export->import->export round-trip is byte-stable, so an exact compare is safe.
+  echo "==> Detecting changes vs the instance ..."
+  local cur id cf ct _w _p; cur="$(mktemp -d)"
+  docker exec "$N8N_CONTAINER" sh -c 'rm -rf /tmp/cur && mkdir -p /tmp/cur; n8n export:workflow --all --separate --pretty --output=/tmp/cur >/dev/null 2>&1 || true'
+  docker cp "$N8N_CONTAINER:/tmp/cur/." "$cur/" >/dev/null 2>&1 || true
+  docker exec "$N8N_CONTAINER" rm -rf /tmp/cur
+  declare -A CURPF=()
+  while IFS='|' read -r _w _p; do [ -n "$_w" ] && CURPF["$_w"]="$_p"; done \
+    < <(printf 'SELECT id,"parentFolderId" FROM workflow_entity;\n' | pg)
+  local changed=()
+  for f in "${files[@]}"; do
+    id="$(basename "$f" .json)"; cf="$cur/$id.json"
+    if [ -f "$cf" ]; then
+      ct="$(mktemp)"
+      jq --arg p "${CURPF[$id]:-}" '.parentFolderId = (if $p=="" then null else $p end)' "$cf" | jq -S "$NORMALIZE_JQ" > "$ct"
+      cmp -s "$f" "$ct" || changed+=("$f")
+      rm -f "$ct"
+    else
+      changed+=("$f")
+    fi
+  done
+  rm -rf "$cur"
+  echo "==> ${#changed[@]} of ${#files[@]} in-scope workflow(s) changed ($(( ${#files[@]} - ${#changed[@]} )) unchanged, skipped)."
 
-  # 2. folders: id-preserving upsert of the tree into $proj (two passes for the
-  #    self-referential parentFolderId FK). Folders are keyed by ID — n8n allows
-  #    duplicate folder NAMES, so the name is NOT an identifier — and forced into
-  #    $proj so a workflow and its folder always share a project.
+  # folders: id-preserving upsert of the tree into $proj (two passes for the
+  # self-referential parentFolderId FK). Keyed by ID — n8n allows duplicate folder
+  # NAMES. Always run (cheap, no triggers); also picks up folder renames.
   local nfolders jqprog
   nfolders="$([ -f "$WORKFLOWS_DIR/folders.json" ] && jq 'length' "$WORKFLOWS_DIR/folders.json" || echo 0)"
   if [ "$nfolders" -gt 0 ]; then
@@ -317,102 +326,111 @@ JQ
     jq -r --arg proj "$proj" "$jqprog" "$WORKFLOWS_DIR/folders.json" | pg >/dev/null
   fi
 
-  # 3. workflows: id-preserving CLI import (the folders above already exist, so each
-  #    workflow's parentFolderId resolves). Note: import deactivates.
-  echo "==> Importing ${#files[@]} workflow(s) via the container CLI ..."
-  local stage; stage="$(mktemp -d)"; cp "${files[@]}" "$stage/"
-  nsh 'rm -rf /tmp/import && mkdir -p /tmp/import'
-  docker cp "$stage/." "$N8N_CONTAINER:/tmp/import/" >/dev/null && rm -rf "$stage"
-  nsh "n8n import:workflow --separate --input=/tmp/import; rm -rf /tmp/import"
-
-  # 4. ownership + folder membership (both by id). The CLI won't re-own an existing
-  #    workflow (and on a multi-user instance leaves a fresh import unowned), so set
-  #    ownership directly in shared_workflow ($proj); set parentFolderId from the
-  #    workflow JSON (the CLI import doesn't reliably set it).
-  local f id pfid
-  for f in "${files[@]}"; do
-    id="$(basename "$f" .json)"
-    printf "DELETE FROM shared_workflow WHERE \"workflowId\"='%s' AND role='workflow:owner'; INSERT INTO shared_workflow (\"workflowId\",\"projectId\",role,\"createdAt\",\"updatedAt\") VALUES ('%s','%s','workflow:owner',now(),now()) ON CONFLICT (\"workflowId\",\"projectId\") DO UPDATE SET role='workflow:owner',\"updatedAt\"=now();\n" \
-      "$(sqesc "$id")" "$(sqesc "$id")" "$(sqesc "$proj")" | pg >/dev/null
-    pfid="$(jq -r '.parentFolderId // empty' "$f")"
-    if [ -n "$pfid" ]; then
-      printf "UPDATE workflow_entity SET \"parentFolderId\"='%s' WHERE id='%s';\n" "$(sqesc "$pfid")" "$(sqesc "$id")" | pg >/dev/null
-    else
-      printf "UPDATE workflow_entity SET \"parentFolderId\"=NULL WHERE id='%s';\n" "$(sqesc "$id")" | pg >/dev/null
+  local pending=""
+  if [ "${#changed[@]}" -eq 0 ]; then
+    echo "==> No changed workflows — skipping import + activation (no downtime)."
+  else
+    # 1. credential stubs (changed set): seed referenced-but-missing creds empty
+    #    (diff vs the target's export so filled-in secrets are never overwritten).
+    local needed have stubs
+    needed="$(jq -s '[ .[].nodes[]? | (.credentials // {}) | to_entries[]
+      | {id: .value.id, name: .value.name, type: .key} | select(.id != null) ] | unique_by(.id)' "${changed[@]}")"
+    have="$(nsh 'rm -f /tmp/creds.json; n8n export:credentials --all --output=/tmp/creds.json >/dev/null 2>&1 || true; cat /tmp/creds.json 2>/dev/null || echo "[]"; rm -f /tmp/creds.json' | jq -c '[ .[].id ]')"
+    stubs="$(jq -n --argjson n "$needed" --argjson h "$have" \
+      '[ $n[] | select((.id as $i | $h | index($i)) | not) | {id, name, type, data: {}} ]')"
+    if [ "$(jq length <<<"$stubs")" -gt 0 ]; then
+      echo "==> Seeding credential stubs (fill secrets in the UI — EDIT the stub):"
+      jq -r '.[] | "  + \(.name)  [\(.type)]  id=\(.id)"' <<<"$stubs"
+      local tmp; tmp="$(mktemp)"; printf '%s' "$stubs" > "$tmp"
+      nsh 'rm -rf /tmp/stubs && mkdir -p /tmp/stubs'
+      docker cp "$tmp" "$N8N_CONTAINER:/tmp/stubs/stubs.json" >/dev/null && rm -f "$tmp"
+      nsh 'n8n import:credentials --input=/tmp/stubs/stubs.json; rm -rf /tmp/stubs'
     fi
-  done
 
-  # 5. activation — CREDENTIAL-AWARE + cycle-safe.
-  #    Readiness: a workflow is READY when every credential its ENABLED nodes
-  #    reference already EXISTED on the target before this run (i.e. is in `have`).
-  #    Freshly-seeded stubs are not in `have`, so those workflows are reported as
-  #    "pending" (fill the secret in the UI, then re-run) instead of failing.
-  local filled_json="${have:-[]}" want name missing
-  local ready_ids=() pending=""
-  echo "==> Resolving credential-readiness ..."
-  for f in "${files[@]}"; do
-    id="$(basename "$f" .json)"; want="$(jq -r '.active' "$f")"; name="$(jq -r '.name' "$f")"
-    if [ "$want" != "true" ]; then
-      if [ -n "$ACT_KEY" ]; then docker exec -e N8N_API_KEY="$ACT_KEY" "$N8N_CONTAINER" node -e "$NODE_ACTIVATE" "$id" false >/dev/null 2>&1 || true
-      else nexec n8n unpublish:workflow --id="$id" >/dev/null 2>&1 || true; fi
-      echo "  ○ inactive   '$name' (id=$id)"; continue
-    fi
-    missing="$(jq -r --argjson filled "$filled_json" '
-      [ .nodes[]? | select(.disabled != true) | (.credentials // {}) | to_entries[]
-        | {id: .value.id, name: .value.name, type: .key} | select(.id != null) ]
-      | unique_by(.id) | map(select(.id as $i | ($filled | index($i)) | not))
-      | .[] | "\(.name) [\(.type)] id=\(.id)"' "$f")"
-    if [ -n "$missing" ]; then
-      echo "  ⏳ '$name' (id=$id) — pending credentials:"
-      sed 's/^/        · /' <<<"$missing"
-      pending+="  • $name (id=$id):"$'\n'"$(sed 's/^/        · /' <<<"$missing")"$'\n'
-      continue
-    fi
-    echo "  ✓ ready      '$name' (id=$id)"; ready_ids+=("$id")
-  done
+    # 2. workflows: id-preserving CLI import of the CHANGED set (folders above
+    #    already exist, so parentFolderId resolves). Note: import deactivates.
+    echo "==> Importing ${#changed[@]} changed workflow(s) via the container CLI ..."
+    local stage; stage="$(mktemp -d)"; cp "${changed[@]}" "$stage/"
+    nsh 'rm -rf /tmp/import && mkdir -p /tmp/import'
+    docker cp "$stage/." "$N8N_CONTAINER:/tmp/import/" >/dev/null && rm -rf "$stage"
+    nsh "n8n import:workflow --separate --input=/tmp/import; rm -rf /tmp/import"
 
-  if [ "${#ready_ids[@]}" -gt 0 ]; then
-    # PRE-PUBLISH in the DB, exactly like n8n Source Control's resolvePublishedStatus:
-    # set activeVersionId directly via a raw UPDATE. In n8n 2.x a parent workflow may
-    # only reference a PUBLISHED sub-workflow (activeVersionId != null); the publish-
-    # time check runs in BOTH the API activate and `publish:workflow`, so a MUTUAL
-    # Execute-Sub-workflow cycle deadlocks (neither can publish first). A raw UPDATE
-    # bypasses that check; the check reads activeVersionId fresh from the DB, so once
-    # all ready workflows have it set, every reference resolves. NOTE: this does NOT
-    # register triggers — the API activate below does that.
-    local ids_sql; ids_sql="$(printf "'%s'," "${ready_ids[@]}")"; ids_sql="${ids_sql%,}"
-    echo "==> Pre-publishing ${#ready_ids[@]} workflow(s) in the DB (activeVersionId := versionId) ..."
-    printf 'UPDATE workflow_entity SET active=true, "activeVersionId"="versionId" WHERE id IN (%s);\n' "$ids_sql" | pg >/dev/null
-
-    if [ -n "$ACT_KEY" ]; then
-      # Register triggers LIVE via the API (no restart). References already resolve,
-      # so no deadlock; the passes only absorb transient errors (e.g. Telegram
-      # setWebhook rate-limits). A trigger that genuinely can't register on this env
-      # (e.g. a webhook with no public HTTPS URL) warns — non-fatal.
-      echo "==> Activating ${#ready_ids[@]} workflow(s) via the API (live — no restart) ..."
-      declare -A last_err=()
-      local remaining=("${ready_ids[@]}") pass failed err
-      for pass in 1 2 3; do
-        [ "${#remaining[@]}" -gt 0 ] || break
-        failed=()
-        for id in "${remaining[@]}"; do
-          if err="$(docker exec -e N8N_API_KEY="$ACT_KEY" "$N8N_CONTAINER" node -e "$NODE_ACTIVATE" "$id" true 2>&1)"; then
-            echo "  ▶ activated   (id=$id)"
-          else
-            failed+=("$id"); last_err["$id"]="$err"
-          fi
-        done
-        remaining=("${failed[@]+"${failed[@]}"}")
-        [ "${#remaining[@]}" -gt 0 ] || break
-        [ "$pass" -lt 3 ] && { echo "  ↻ ${#remaining[@]} not active yet (transient) — retry pass $((pass+1)) after backoff ..."; sleep 5; }
-      done
-      if [ "${#remaining[@]}" -gt 0 ]; then
-        for id in "${remaining[@]}"; do
-          echo "  ⚠ could not activate id=$id after 3 passes (non-fatal): $(printf '%s' "${last_err[$id]:-}" | tr '\n' ' ' | cut -c1-180)" >&2
-        done
+    # 3. ownership + folder membership (by id) for the imported set.
+    local f pfid
+    for f in "${changed[@]}"; do
+      id="$(basename "$f" .json)"
+      printf "DELETE FROM shared_workflow WHERE \"workflowId\"='%s' AND role='workflow:owner'; INSERT INTO shared_workflow (\"workflowId\",\"projectId\",role,\"createdAt\",\"updatedAt\") VALUES ('%s','%s','workflow:owner',now(),now()) ON CONFLICT (\"workflowId\",\"projectId\") DO UPDATE SET role='workflow:owner',\"updatedAt\"=now();\n" \
+        "$(sqesc "$id")" "$(sqesc "$id")" "$(sqesc "$proj")" | pg >/dev/null
+      pfid="$(jq -r '.parentFolderId // empty' "$f")"
+      if [ -n "$pfid" ]; then
+        printf "UPDATE workflow_entity SET \"parentFolderId\"='%s' WHERE id='%s';\n" "$(sqesc "$pfid")" "$(sqesc "$id")" | pg >/dev/null
+      else
+        printf "UPDATE workflow_entity SET \"parentFolderId\"=NULL WHERE id='%s';\n" "$(sqesc "$id")" | pg >/dev/null
       fi
-    else
-      echo "  ⚠ no N8N_API_KEY — workflow(s) pre-published in the DB; restart n8n to register triggers."
+    done
+
+    # 4. activation — CREDENTIAL-AWARE + cycle-safe (imported set only). A workflow
+    #    is READY when every credential its ENABLED nodes reference already EXISTED
+    #    (in `have`); freshly-seeded stubs aren't, so those are left inactive + listed
+    #    as "pending" (fill the secret, re-run) rather than activated broken.
+    local filled_json="${have:-[]}" want name missing
+    local ready_ids=()
+    echo "==> Resolving credential-readiness ..."
+    for f in "${changed[@]}"; do
+      id="$(basename "$f" .json)"; want="$(jq -r '.active' "$f")"; name="$(jq -r '.name' "$f")"
+      if [ "$want" != "true" ]; then
+        if [ -n "$ACT_KEY" ]; then docker exec -e N8N_API_KEY="$ACT_KEY" "$N8N_CONTAINER" node -e "$NODE_ACTIVATE" "$id" false >/dev/null 2>&1 || true
+        else nexec n8n unpublish:workflow --id="$id" >/dev/null 2>&1 || true; fi
+        echo "  ○ inactive   '$name' (id=$id)"; continue
+      fi
+      missing="$(jq -r --argjson filled "$filled_json" '
+        [ .nodes[]? | select(.disabled != true) | (.credentials // {}) | to_entries[]
+          | {id: .value.id, name: .value.name, type: .key} | select(.id != null) ]
+        | unique_by(.id) | map(select(.id as $i | ($filled | index($i)) | not))
+        | .[] | "\(.name) [\(.type)] id=\(.id)"' "$f")"
+      if [ -n "$missing" ]; then
+        echo "  ⏳ '$name' (id=$id) — pending credentials:"
+        sed 's/^/        · /' <<<"$missing"
+        pending+="  • $name (id=$id):"$'\n'"$(sed 's/^/        · /' <<<"$missing")"$'\n'
+        continue
+      fi
+      echo "  ✓ ready      '$name' (id=$id)"; ready_ids+=("$id")
+    done
+
+    if [ "${#ready_ids[@]}" -gt 0 ]; then
+      # PRE-PUBLISH in the DB (like Source Control's resolvePublishedStatus): set
+      # activeVersionId directly so a MUTUAL Execute-Sub-workflow cycle resolves (the
+      # publish-time ref-check reads it fresh from the DB) — then API-activate
+      # registers the live trigger. psql alone does NOT register the trigger.
+      local ids_sql; ids_sql="$(printf "'%s'," "${ready_ids[@]}")"; ids_sql="${ids_sql%,}"
+      echo "==> Pre-publishing ${#ready_ids[@]} workflow(s) in the DB (activeVersionId := versionId) ..."
+      printf 'UPDATE workflow_entity SET active=true, "activeVersionId"="versionId" WHERE id IN (%s);\n' "$ids_sql" | pg >/dev/null
+      if [ -n "$ACT_KEY" ]; then
+        echo "==> Activating ${#ready_ids[@]} workflow(s) via the API (live — no restart) ..."
+        declare -A last_err=()
+        local remaining=("${ready_ids[@]}") pass failed err
+        for pass in 1 2 3; do
+          [ "${#remaining[@]}" -gt 0 ] || break
+          failed=()
+          for id in "${remaining[@]}"; do
+            if err="$(docker exec -e N8N_API_KEY="$ACT_KEY" "$N8N_CONTAINER" node -e "$NODE_ACTIVATE" "$id" true 2>&1)"; then
+              echo "  ▶ activated   (id=$id)"
+            else
+              failed+=("$id"); last_err["$id"]="$err"
+            fi
+          done
+          remaining=("${failed[@]+"${failed[@]}"}")
+          [ "${#remaining[@]}" -gt 0 ] || break
+          [ "$pass" -lt 3 ] && { echo "  ↻ ${#remaining[@]} not active yet (transient) — retry pass $((pass+1)) after backoff ..."; sleep 5; }
+        done
+        if [ "${#remaining[@]}" -gt 0 ]; then
+          for id in "${remaining[@]}"; do
+            echo "  ⚠ could not activate id=$id after 3 passes (non-fatal): $(printf '%s' "${last_err[$id]:-}" | tr '\n' ' ' | cut -c1-180)" >&2
+          done
+        fi
+      else
+        echo "  ⚠ no N8N_API_KEY — workflow(s) pre-published in the DB; restart n8n to register triggers."
+      fi
     fi
   fi
 
@@ -554,8 +572,10 @@ COMMANDS
   init               Scaffold this project: $WORKFLOWS_DIR/, $SCOPE_FILE, .n8n-sync.env, .gitignore.
   export             n8n  -> repo. Exports all workflows, normalizes them, mirrors the
                      n8n folder tree as directories, writes $WORKFLOWS_DIR/folders.json.
-  import             repo -> n8n. Id-preserving CLI import; upserts folders (SQL);
-                     seeds missing credential stubs; activates (see ACTIVATION).
+  import             repo -> n8n. Imports ONLY workflows that differ from the
+                     instance (skips unchanged -> no needless re-import/downtime);
+                     id-preserving; upserts folders (SQL); seeds missing credential
+                     stubs; activates (see ACTIVATION).
   normalize [file…]  Canonicalize workflow JSON in place (all under $WORKFLOWS_DIR if none given).
   pull               Safe git pull: export → stash → git pull (3-way merge) → import.
   projects           List the target's projects (id|name|type) to pick a N8N_PROJECT_ID.

@@ -44,8 +44,8 @@ The **host** bundle (`dist/n8n-sync.mjs`) now carries **no DB driver** — it do
 |---|---|---|
 | `n8n-sync normalize [files…]` | host | canonicalize workflow JSON in place (sort keys, strip volatile + instance-specific fields incl. node credential-ref `name`). |
 | `n8n-sync hook-path` | host | print the path to `dist/hook.cjs` for `EXTERNAL_HOOK_FILES`. |
-| `n8n n8n-sync:export` | in-container | n8n → repo: export in-scope workflows, normalize, mirror the folder tree, write `folders.json`; prune archived. |
-| `n8n n8n-sync:import` | in-container | repo → n8n: id-preserving import (`ImportService`), folders, cycle-safe in-process activation; archive orphans, restore (un-archive) workflows present in git. |
+| `n8n n8n-sync:export` | in-container | n8n → repo: export in-scope workflows, normalize, mirror the folder tree, write `folders.json`; prune archived; refresh `SCOPE_FILE` names from the instance. |
+| `n8n n8n-sync:import` | in-container | repo → n8n: id-preserving import (`ImportService`), folders, cycle-safe in-process activation; archive orphans, restore (un-archive) workflows present in git; refresh `SCOPE_FILE` names from git. |
 | `n8n n8n-sync:projects` | in-container | list projects (`id\|name\|type`) to pick a project id. |
 
 Config is env-driven (flag-free in-container): `WORKFLOWS_DIR`, `SCOPE_FILE`, `N8N_PROJECT_ID`,

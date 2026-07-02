@@ -2,12 +2,13 @@ import fs from 'node:fs';
 
 // SCOPE_FILE (workflow-ids.json) upkeep — pure fs, no n8n. Kept in the repo's canonical shape and
 // written IN PLACE (preserves a single-file bind mount). Skipped when the file is absent (absent =
-// "all" scope — must never be narrowed). The scope path is read per-call (honors a changed env).
+// "all" scope — must never be narrowed). The scope path is read per-call (honors a changed env);
+// engine callers pass their cfg.scopeFile explicitly instead.
 
 export interface ScopeEntry { id: string; name: string }
 
-function maintainScope(mutate: (list: ScopeEntry[]) => boolean): void {
-  const scopeFile = process.env.SCOPE_FILE || 'workflow-ids.json';
+function maintainScope(mutate: (list: ScopeEntry[]) => boolean, scopeFile?: string): void {
+  scopeFile = scopeFile || process.env.SCOPE_FILE || 'workflow-ids.json';
   if (!fs.existsSync(scopeFile)) return;
   try {
     const parsed = JSON.parse(fs.readFileSync(scopeFile, 'utf8'));
@@ -39,3 +40,16 @@ export const removeScope = (id: string): void => maintainScope((list) => {
   const i = list.findIndex((w) => String(w.id) === id);
   if (i < 0) return false; list.splice(i, 1); return true;
 });
+/** export/import: refresh tracked entries' names from an authoritative id→name map (the DB on
+ *  export, the git JSON on import). Renames that arrive via git→import never fire the
+ *  workflow.afterUpdate hook (ImportService is a raw upsert), so without this sweep the scope
+ *  file's names go stale forever. Never adds or removes entries — membership stays with the
+ *  hook (UI create/delete/archive) and the user. */
+export const syncScopeNames = (names: Map<string, string>, scopeFile?: string): void => maintainScope((list) => {
+  let changed = false;
+  for (const e of list) {
+    const name = names.get(String(e.id));
+    if (name != null && e.name !== name) { e.name = name; changed = true; }
+  }
+  return changed;
+}, scopeFile);

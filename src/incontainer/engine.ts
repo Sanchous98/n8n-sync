@@ -5,6 +5,7 @@ import { serializeWorkflow } from '../normalize';
 import { buildFolderPath } from '../folders';
 import { walkWorkflowJson, removeEmptyDirs } from '../fsutil';
 import { scopeIds } from '../config';
+import { syncScopeNames } from './scope';
 import { credsOf, tagName, type Workflow, type Cred } from '../workflow';
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
@@ -102,6 +103,13 @@ export async function runExport(cfg: EngineCfg): Promise<void> {
   fs.writeFileSync(path.join(cfg.workflowsDir, 'folders.json'), JSON.stringify(manifest, null, 2) + '\n');
 
   removeEmptyDirs(cfg.workflowsDir);
+
+  // Names in SCOPE_FILE follow the instance (see syncScopeNames) — heals entries that went stale
+  // while the realtime hook wasn't watching (git→import renames, edits on a hook-less instance).
+  const dbNames = new Map<string, string>();
+  for (const wf of all) if (typeof wf.name === 'string') dbNames.set(String(wf.id), wf.name);
+  syncScopeNames(dbNames, cfg.scopeFile);
+
   if (pruned) err(`==> pruned ${pruned} archived workflow(s) from ./${cfg.workflowsDir}/\n`);
   err(`==> ${kept} workflow(s) + ${manifest.length} folder(s) in ./${cfg.workflowsDir}/ — review 'git diff', then commit.\n`);
 }
@@ -326,6 +334,16 @@ export async function runImport(cfg: EngineCfg): Promise<number> {
     });
     err('==> ImportService done (upsert + owner + activation in-process); tags linked by name; parentFolderId re-asserted.\n');
   }
+
+  // Names in SCOPE_FILE follow git after an import (a git-side rename never fires the
+  // workflow.afterUpdate hook — ImportService is a raw upsert; see syncScopeNames). Swept over ALL
+  // in-scope files, not just changed ones, so a stale name heals even when content already matches.
+  const gitNames = new Map<string, string>();
+  for (const f of files) {
+    const n = (readJson(f) as { name?: unknown }).name;
+    if (typeof n === 'string') gitNames.set(path.basename(f, '.json'), n);
+  }
+  syncScopeNames(gitNames, cfg.scopeFile);
 
   // Orphans: owned by the project, in scope, gone from git → ARCHIVE (deactivate + isArchived),
   // mirroring export's pruning. Deregister the live trigger first.

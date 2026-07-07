@@ -244,7 +244,16 @@ export async function runImport(cfg: EngineCfg): Promise<number> {
   // Change detection: only re-import workflows whose normalized form differs from the instance.
   err('==> Detecting changes vs the instance ...\n');
   const current = new Map<string, string>();
-  for (const wf of await findAllWorkflows(ds)) current.set(wf.id as string, serializeEntity(wf));
+  // `settings.availableInMCP` is stripped from the on-disk form (see normalize.ts) — it's an
+  // instance-side MCP-exposure toggle, not part of the portable definition. Capture the instance's
+  // CURRENT value per workflow so we can re-inject it on import; otherwise ImportService's settings
+  // upsert would clobber it back to "unset". NB: key is uppercase `MCP`.
+  const dbAvailableInMCP = new Map<string, unknown>();
+  for (const wf of await findAllWorkflows(ds)) {
+    current.set(wf.id as string, serializeEntity(wf));
+    const s = wf.settings as Record<string, unknown> | null | undefined;
+    if (s && typeof s === 'object' && 'availableInMCP' in s) dbAvailableInMCP.set(wf.id as string, s.availableInMCP);
+  }
   const changedFiles: string[] = [];
   for (const f of files) {
     const id = path.basename(f, '.json');
@@ -316,6 +325,12 @@ export async function runImport(cfg: EngineCfg): Promise<number> {
       plain.parentFolderId = plain.parentFolderId ?? null;
       pfByWf.set(id, plain.parentFolderId);
       plain.isArchived = false; // restore archived; new/updated default to live
+      // Preserve the instance-side MCP-exposure toggle: normalize strips settings.availableInMCP from
+      // git (it flips per instance and isn't portable), so the JSON never carries it. Re-inject the
+      // instance's current value here so ImportService's whole-settings upsert doesn't wipe it.
+      if (dbAvailableInMCP.has(id)) {
+        plain.settings = { ...((plain.settings as Record<string, unknown>) ?? {}), availableInMCP: dbAvailableInMCP.get(id) };
+      }
       const ent = repo.create(plain);
       ent.versionMetadata = plain.versionMetadata ?? null;
       return ent;

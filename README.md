@@ -1,6 +1,6 @@
 # n8n-sync (TypeScript engine)
 
-> **Status: `2.0.0`** (stable) — published to GitHub Packages as `@andreapalladiokiv/n8n-sync`.
+> **Status: `2.0.0`** (stable) — published to GitHub Packages as `@sanchous98/n8n-sync`.
 > **2.x is a clean break from 1.x**: instead of a self-contained bundle that opened its OWN
 > `@n8n/typeorm` DataSource and shelled out to the `n8n` CLI + REST API, 2.x runs **inside the n8n
 > process** and reuses n8n's OWN DataSource + services. No bundled DB driver, no `n8n` CLI
@@ -73,8 +73,8 @@ environment:
   SCOPE_FILE: /repo/workflow-ids.json
 volumes:
   - .:/repo                                                                               # repo (workflows + scope)
-  - ./node_modules/@andreapalladiokiv/n8n-sync/dist:/opt/n8n-sync:ro                      # hook.cjs + preload.cjs
-  - ./node_modules/@andreapalladiokiv/n8n-sync/dist/n8n-cmd:/usr/local/lib/node_modules/n8n/dist/commands/n8n-sync:ro  # drop-in CLI commands
+  - ./node_modules/@sanchous98/n8n-sync/dist:/opt/n8n-sync:ro                      # hook.cjs + preload.cjs
+  - ./node_modules/@sanchous98/n8n-sync/dist/n8n-cmd:/usr/local/lib/node_modules/n8n/dist/commands/n8n-sync:ro  # drop-in CLI commands
 ```
 
 Batch sync from the host then `docker exec`s the in-container commands, e.g.

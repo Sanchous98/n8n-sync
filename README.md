@@ -45,7 +45,7 @@ The **host** bundle (`dist/n8n-sync.mjs`) now carries **no DB driver** — it do
 | `n8n-sync normalize [files…]` | host | canonicalize workflow JSON in place (sort keys, strip volatile + instance-specific fields incl. node credential-ref `name`). |
 | `n8n-sync hook-path` | host | print the path to `dist/hook.cjs` for `EXTERNAL_HOOK_FILES`. |
 | `n8n n8n-sync:export` | in-container | n8n → repo: export in-scope workflows, normalize, mirror the folder tree, write `folders.json`; prune archived; refresh `SCOPE_FILE` names from the instance. |
-| `n8n n8n-sync:import` | in-container | repo → n8n: id-preserving import (`ImportService`), folders, cycle-safe in-process activation; archive orphans, restore (un-archive) workflows present in git; refresh `SCOPE_FILE` names from git. |
+| `n8n n8n-sync:import` | in-container | repo → n8n: id-preserving import (`ImportService`), folders, cycle-safe in-process activation; archive orphans, restore (un-archive) workflows present in git; refresh `SCOPE_FILE` names from git. Activation is published through n8n's workflow publication service (the DB outbox) so webhook/trigger registrations follow; requires queue mode. |
 | `n8n n8n-sync:projects` | in-container | list projects (`id\|name\|type`) to pick a project id. |
 
 Config is env-driven (flag-free in-container): `WORKFLOWS_DIR`, `SCOPE_FILE`, `N8N_PROJECT_ID`,
@@ -97,7 +97,11 @@ external hook itself cannot register commands — it loads after n8n's command l
 Only the external-hook **event names** are stable. **Pin the n8n version and smoke-test on every
 upgrade.** Notes: `activeState:'fromJson'` activation requires `EXECUTIONS_MODE=queue` (or multi-main);
 `ImportService` swallows activation errors (a workflow with missing credentials imports but stays
-inactive — fill creds, re-import).
+inactive — fill creds, re-import). Re-activation of imported active workflows (2.0.5+) requires n8n's
+workflow publication service (`N8N_USE_WORKFLOW_PUBLICATION_SERVICE=true`, the n8n 2.x default): a
+short-lived `n8n n8n-sync:import` process cannot register webhooks that outlive it, so if the service
+is disabled the import still lands but active webhook workflows may answer 404 until a reconcile or a
+UI toggle — `import` prints a warning in that case.
 
 ## Develop
 

@@ -218,10 +218,26 @@ export function assertQueueMode(mode: string | undefined): void {
   }
 }
 
+/** Whether n8n will publish through the DB outbox — the ONLY channel a short-lived `n8n n8n-sync:import`
+ *  process has to the long-running processes that serve triggers. `workflows.useWorkflowPublicationService`
+ *  defaults to true in current n8n; only an explicit `false` turns it off, in which case activateWorkflow
+ *  falls back to ActiveWorkflowManager and registers triggers in THIS process's memory. Those registrations
+ *  are discarded when the CLI exits, so an imported active workflow stays active:true yet keeps answering
+ *  404 — the periodic reconciler does not heal WEBHOOK triggers (findMissingActiveWorkflows only inspects
+ *  non-webhook ones). Defaults to enabled when the field is absent, matching n8n. */
+export function publicationServiceEnabled(cfg: { useWorkflowPublicationService?: boolean } | undefined): boolean {
+  return cfg?.useWorkflowPublicationService !== false;
+}
+
 export async function runImport(cfg: EngineCfg): Promise<number> {
   // Mode gate — fail fast (before any FS/DB work) if this instance can't make activation stick.
   // Same source of truth n8n itself reads: GlobalConfig.executions.mode (see assertQueueMode).
-  assertQueueMode(bridge.globalConfig().executions.mode);
+  const globalCfg = bridge.globalConfig();
+  assertQueueMode(globalCfg.executions.mode);
+  // Whether activation can actually reach the long-running processes (the DB outbox). See
+  // publicationServiceEnabled — with it off, re-activation below is a no-op that we must not
+  // report as success.
+  const publicationOn = publicationServiceEnabled(globalCfg.workflows);
   const scope = new Set(scopeIds(cfg.scopeFile));
   const inScope = (id: string): boolean => scope.size === 0 || scope.has(id);
   let files = walkWorkflowJson(cfg.workflowsDir).sort();
@@ -369,8 +385,18 @@ export async function runImport(cfg: EngineCfg): Promise<number> {
     // `workflows.useWorkflowPublicationService` on it publishes via the outbox, off it goes through
     // ActiveWorkflowManager.
     //
-    // Only ACTIVE workflows need it: an inactive one has nothing registered to go stale.
-    if (activeChanged.length > 0) {
+    // Only ACTIVE workflows need it: an inactive one has nothing registered to go stale. And only when
+    // the publication service is ON: with it off, activateWorkflow registers triggers in THIS process's
+    // memory, which vanish when the CLI exits — reporting that as success would reproduce the very
+    // 404-while-active bug this block exists to fix. (We still attempted the import; the workflow is in
+    // the DB and will heal on the next periodic reconcile for non-webhook triggers, or via toggle.)
+    if (activeChanged.length > 0 && !publicationOn) {
+      err(`n8n-sync: WARNING ${activeChanged.length} imported active workflow(s) will keep serving their ` +
+          `previous registration, or none at all: n8n's workflow publication service is disabled ` +
+          `(workflows.useWorkflowPublicationService=false). A short-lived import process cannot register ` +
+          `webhooks that outlive it — the import landed, but production webhooks may answer 404 until a ` +
+          `reconcile or a UI toggle. Enable N8N_USE_WORKFLOW_PUBLICATION_SERVICE=true and re-import.\n`);
+    } else if (activeChanged.length > 0) {
       err(`==> Re-activating ${activeChanged.length} imported active workflow(s) so their triggers and webhooks follow ...\n`);
       const { UserRepository } = bridge.repos();
       const user = await bridge.get<any>(UserRepository).findOne({ where: { id: userId }, relations: ['role'] });

@@ -398,8 +398,13 @@ export async function runImport(cfg: EngineCfg): Promise<number> {
           `reconcile or a UI toggle. Enable N8N_USE_WORKFLOW_PUBLICATION_SERVICE=true and re-import.\n`);
     } else if (activeChanged.length > 0) {
       err(`==> Re-activating ${activeChanged.length} imported active workflow(s) so their triggers and webhooks follow ...\n`);
-      const { UserRepository } = bridge.repos();
+      const { UserRepository, WorkflowPublishedVersionRepository } = bridge.repos();
       const user = await bridge.get<any>(UserRepository).findOne({ where: { id: userId }, relations: ['role'] });
+      // Present on every n8n release that has the publication service (which is exactly the branch
+      // we are in). Guarded so an older/internal change cannot turn a deploy into a hard failure.
+      const publishedVersions = WorkflowPublishedVersionRepository
+        ? bridge.get<any>(WorkflowPublishedVersionRepository)
+        : null;
       let done = 0;
       const failures: string[] = [];
       if (!user) {
@@ -409,7 +414,21 @@ export async function runImport(cfg: EngineCfg): Promise<number> {
         for (const id of activeChanged) {
           // No versionId: activateWorkflow falls back to the workflow's current versionId, which is
           // the definition we just imported — exactly what we want published.
-          try { await ws.activateWorkflow(user, id); done++; }
+          try {
+            // Clear the published-version pointer first so the applier in the RUNNING leader treats
+            // this as a first publish and (re)registers every trigger.
+            //
+            // Why: ImportService.DEACTIVATES an existing active workflow before upserting it, and
+            // that path deletes the durable trigger jobs (scheduled_job) in THIS short-lived
+            // process. The leader still holds the old in-memory registration, so a normal publish
+            // sees the trigger as registered, computes an empty trigger diff and skips it: the
+            // workflow stays active:true while its cron trigger is gone until a restart. With
+            // oldVersion=null the applier adds every desired trigger, which re-provisions schedule
+            // jobs and re-registers webhooks/pollers. It also makes the publish idempotent.
+            if (publishedVersions) await publishedVersions.removePublishedVersion(id);
+            await ws.activateWorkflow(user, id);
+            done++;
+          }
           catch (e: any) { failures.push(`${id}: ${e?.message ?? e}`); }
         }
       }

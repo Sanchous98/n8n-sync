@@ -103,6 +103,13 @@ short-lived `n8n n8n-sync:import` process cannot register webhooks that outlive 
 is disabled the import still lands but active webhook workflows may answer 404 until a reconcile or a
 UI toggle — `import` prints a warning in that case.
 
+Re-activation is a **full republish** (2.0.7+): the published-version pointer is cleared before
+`WorkflowService.activateWorkflow`, so the running leader recomputes the trigger set from scratch and
+re-provisions schedule jobs. This is required because `ImportService` deactivates an existing active
+workflow before upserting it, which deletes its durable trigger jobs (`scheduled_job`) in the
+short-lived import process while the leader still holds the old in-memory registration — a normal
+publish would then compute an empty trigger diff and leave the workflow active with a dead cron.
+
 ## Develop
 
 ```sh
